@@ -11,7 +11,6 @@ import numpy as np
 import resampy
 import soundfile as sf
 import tensorflow as tf
-import tensorflow_hub as hub
 
 from config import (
     EVENT_DROP_MARGIN,
@@ -91,10 +90,12 @@ def _resample_audio(audio: np.ndarray, source_rate: int, target_rate: int) -> np
     return resampy.resample(audio, source_rate, target_rate).astype(np.float32)
 
 
-def _read_labels_from_model(model) -> list[str]:
-    class_map_path = model.class_map_path().numpy().decode("utf-8")
-    with tf.io.gfile.GFile(class_map_path) as csv_file:
-        rows = list(csv.DictReader(csv_file))
+def _read_labels_from_model_dir(model_dir: Path) -> list[str]:
+    class_map_path = model_dir / "yamnet_class_map.csv"
+    if not class_map_path.exists():
+        raise FileNotFoundError(f"Class map not found: {class_map_path}")
+    with open(class_map_path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     labels = [row["display_name"] for row in rows]
     if not labels:
         raise RuntimeError("YAMNet class map is empty")
@@ -111,17 +112,19 @@ def _score_bucket(label_scores: list[tuple[str, float]], keywords: tuple[str, ..
 
 
 @lru_cache(maxsize=1)
-def _load_runtime() -> tuple[object, list[str]]:
+def _load_runtime() -> tuple[object, list[str], str]:
     if not EVENT_MODEL_PATH:
         raise RuntimeError("EKKO_AUDIO_EVENT_MODEL_PATH is not configured")
     model_path = Path(EVENT_MODEL_PATH).expanduser()
     if not model_path.exists():
         raise RuntimeError(f"YAMNet model path does not exist: {model_path}")
     logger.info("loading yamnet model path=%s", model_path)
-    model = hub.load(str(model_path))
-    labels = _read_labels_from_model(model)
-    logger.info("yamnet model loaded labels=%s", len(labels))
-    return model, labels
+    loaded = tf.saved_model.load(str(model_path))
+    infer = loaded.signatures["serving_default"]
+    input_key = list(infer.structured_input_signature[1].keys())[0]
+    labels = _read_labels_from_model_dir(model_path)
+    logger.info("yamnet model loaded labels=%s input_key=%s", len(labels), input_key)
+    return infer, labels, input_key
 
 
 def warmup_model() -> tuple[bool, str | None]:
@@ -144,7 +147,7 @@ def get_runtime_status() -> dict[str, object]:
 
 class AudioEventService:
     def classify(self, *, audio_base64: str, audio_format: str = "wav", top_k: int = 8) -> dict:
-        model, labels = _load_runtime()
+        infer, labels, input_key = _load_runtime()
         audio, sample_rate = _decode_audio(audio_base64, audio_format)
         audio = _resample_audio(audio, sample_rate, EVENT_TARGET_SAMPLE_RATE)
 
@@ -152,7 +155,10 @@ class AudioEventService:
             raise ValueError("Audio payload is empty after decode")
 
         waveform = tf.convert_to_tensor(audio, dtype=tf.float32)
-        scores, _embeddings, _spectrogram = model(waveform)
+        outputs = infer(**{input_key: waveform})
+        # YAMNet 输出: scores, embeddings, spectrogram (取第一个作为 scores)
+        output_values = list(outputs.values())
+        scores = output_values[0]
         mean_scores = np.asarray(scores.numpy(), dtype=np.float32).mean(axis=0)
 
         ranked_indices = np.argsort(mean_scores)[::-1]
