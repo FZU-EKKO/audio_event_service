@@ -12,6 +12,11 @@ import resampy
 import soundfile as sf
 import tensorflow as tf
 
+# 禁止 TF 一口气吃满显存（YAMNet 只有几 MB，没必要）
+_gpus = tf.config.experimental.list_physical_devices("GPU")
+for _g in _gpus:
+    tf.config.experimental.set_memory_growth(_g, True)
+
 from config import (
     EVENT_DROP_MARGIN,
     EVENT_MODEL_PATH,
